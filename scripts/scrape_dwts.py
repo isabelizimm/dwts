@@ -1,0 +1,302 @@
+"""Scrape Dancing with the Stars (US) weekly scoring data from Wikipedia.
+
+Iterates over seasons 1-34, parsing each season's page and saving a tidy
+weekly-scores table (joined with cast info) to data/season-{n}.parquet.
+"""
+
+import re
+import time
+from pathlib import Path
+
+import polars as pl
+import requests
+from bs4 import BeautifulSoup
+
+DATA_DIR = Path("data")
+FIRST_SEASON = 1
+LAST_SEASON = 34
+
+BASE_URL = (
+    "https://en.wikipedia.org/wiki/"
+    "Dancing_with_the_Stars_(American_TV_series)_season_{season}"
+)
+
+
+HEADERS = {
+    "User-Agent": (
+        "dwts-scraper/0.1 (personal research project; "
+        "contact: local-user@example.com)"
+    )
+}
+
+
+def fetch_soup(season: int) -> BeautifulSoup:
+    resp = requests.get(BASE_URL.format(season=season), headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "lxml")
+
+
+def expand_table_rows(table) -> list[list[str]]:
+    """Turn a wikitable into a grid of text cells, expanding rowspan/colspan.
+
+    A rowspanned cell normally repeats its text on every row it covers.
+    However, some Wikipedia "group dance" cells pack N newline-separated
+    names into a single cell with rowspan=N (one distinct name per row,
+    rather than the same text repeated) -- those are distributed
+    sequentially instead of duplicated.
+    """
+    rows = table.find_all("tr")
+    grid: list[list[str]] = []
+    pending: dict[int, list[str]] = {}  # col -> queue of remaining row values
+
+    for row in rows:
+        cells = row.find_all(["th", "td"])
+        out_row: list[str] = []
+        col = 0
+
+        def place_pending(col):
+            while col in pending:
+                queue = pending[col]
+                out_row.append(queue.pop(0))
+                if not queue:
+                    del pending[col]
+                col += 1
+            return col
+
+        col = place_pending(col)
+
+        for cell in cells:
+            col = place_pending(col)
+            # get_text(strip=True) drops whitespace-only text nodes, so a plain
+            # "\n" placeholder for <br> would vanish; use a non-whitespace
+            # sentinel instead and convert it back afterwards.
+            BR_SENTINEL = "\uE000"
+            for br in cell.find_all("br"):
+                br.replace_with(BR_SENTINEL)
+            text = cell.get_text(" ", strip=True)
+            text = re.sub(rf"\s*{BR_SENTINEL}\s*", "\n", text)
+            # strip footnote/citation markers like "[14]", "[ a ]", "[ i ]"
+            text = re.sub(r"\s*\[\s*[^\]]{0,6}\s*\]", "", text).strip()
+            colspan = int(cell.get("colspan", 1))
+            rowspan = int(cell.get("rowspan", 1))
+
+            parts = text.split("\n")
+            if rowspan > 1 and len(parts) == rowspan:
+                # one distinct value per row this cell spans
+                for i in range(colspan):
+                    out_row.append(parts[0])
+                    pending[col + i] = list(parts[1:])
+            else:
+                for i in range(colspan):
+                    out_row.append(text)
+                    if rowspan > 1:
+                        pending[col + i] = [text] * (rowspan - 1)
+            col += colspan
+            col = place_pending(col)
+
+        col = place_pending(col)
+        grid.append(out_row)
+
+    # pad ragged rows
+    width = max(len(r) for r in grid)
+    grid = [r + [""] * (width - len(r)) for r in grid]
+    return grid
+
+
+def normalize_header(text: str) -> str:
+    """Strip trailing footnote markers (e.g. 'Celebrity [ 14 ]' -> 'Celebrity')."""
+    return re.sub(r"\s*\[.*$", "", text).strip()
+
+
+def parse_cast_table(soup: BeautifulSoup) -> pl.DataFrame:
+    """Parse the 'Couples' table listing celebrity/pro pairs and elimination order."""
+    heading = soup.find(id="Couples") or soup.find(id="Cast")
+    table = heading.find_next("table") if heading else None
+    if table is None:
+        # fallback: first wikitable on the page
+        table = soup.select_one("table.wikitable")
+
+    grid = expand_table_rows(table)
+    header, *body = grid
+    header = [normalize_header(h) for h in header]
+
+    records = []
+    for row in body:
+        rec = dict(zip(header, row))
+        records.append(rec)
+
+    df = pl.DataFrame(records)
+    df = df.rename(
+        {
+            "Celebrity": "celebrity",
+            "Notability": "notability",
+            "Professional partner": "professional",
+            "Status": "status",
+        }
+    )
+    keep = [c for c in ("celebrity", "notability", "professional", "status") if c in df.columns]
+    return df.select(keep)
+
+
+SCORE_RE = re.compile(r"^\s*(\d+)\s*\(([^)]*)\)\s*$")
+
+
+def parse_score_cell(cell: str) -> dict:
+    """Parse a cell like '20 (7, 7, 6)' into total + individual judge scores."""
+    cell = cell.strip()
+    if not cell or cell.lower().startswith("no score"):
+        return {"total_score": None, "judge_scores": None}
+    m = SCORE_RE.match(cell)
+    if not m:
+        return {"total_score": None, "judge_scores": None}
+    total = int(m.group(1))
+    judges = [j.strip() for j in m.group(2).split(",")]
+    judges = [int(j) for j in judges if j.strip().isdigit()]
+    return {"total_score": total, "judge_scores": judges}
+
+
+def parse_weekly_score_tables(soup: BeautifulSoup, season: int) -> pl.DataFrame:
+    """Parse each 'Week N' section's table into a tidy long-format frame."""
+    all_rows = []
+
+    week_headers = soup.select("h3")
+    for h in week_headers:
+        heading_text = h.get_text(" ", strip=True)
+        m = re.match(r"Week\s+(\d+)", heading_text)
+        if not m:
+            continue
+        week_num = int(m.group(1))
+
+        table = h.find_next("table", class_="wikitable")
+        if table is None:
+            continue
+
+        grid = expand_table_rows(table)
+        header, *body = grid
+        header = [normalize_header(c) for c in header]
+
+        for row in body:
+            rec = dict(zip(header, row))
+            couple_cell = rec.get("Couple", "")
+            if not couple_cell:
+                continue
+            # group-dance rows list multiple couples in one cell, newline-joined
+            couples = [c.strip() for c in couple_cell.split("\n") if c.strip()]
+            score_info = parse_score_cell(rec.get("Scores", ""))
+            is_group = len(couples) > 1
+            for couple in couples:
+                all_rows.append(
+                    {
+                        "season": season,
+                        "week": week_num,
+                        "week_label": heading_text,
+                        "couple": couple,
+                        "dance": rec.get("Dance"),
+                        "music": rec.get("Music"),
+                        "total_score": score_info["total_score"],
+                        "judge_scores": score_info["judge_scores"],
+                        "result": rec.get("Result"),
+                        "is_group_dance": is_group,
+                    }
+                )
+
+    return pl.DataFrame(all_rows)
+
+
+def match_couple_to_cast(couple: str, cast_rows: list[dict]) -> dict | None:
+    """Match an abbreviated 'Couple' string (e.g. 'Bill E. & Emma') to a cast row.
+
+    Wikipedia abbreviates celebrities/professionals to first names, adding a
+    last-initial when needed to disambiguate (e.g. 'Bill E.' vs 'Bill N.').
+    We match by checking whether the abbreviation (periods stripped) is a
+    prefix of the cast member's full name.
+    """
+    if " & " not in couple:
+        return None
+    ab_celeb, ab_pro = couple.split(" & ", 1)
+    ab_celeb = ab_celeb.replace(".", "").strip()
+    ab_pro = ab_pro.replace(".", "").strip()
+
+    matches = [
+        row
+        for row in cast_rows
+        if row["celebrity"].startswith(ab_celeb) and row["professional"].startswith(ab_pro)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def join_cast_into_weekly(cast: pl.DataFrame, weekly: pl.DataFrame) -> pl.DataFrame:
+    """Attach celebrity/professional/notability/status columns to each weekly row."""
+    cast_rows = cast.to_dicts()
+
+    mapping = {}
+    unmatched = []
+    for couple in weekly.get_column("couple").unique().to_list():
+        match = match_couple_to_cast(couple, cast_rows)
+        if match is None:
+            unmatched.append(couple)
+        else:
+            mapping[couple] = match
+
+    if unmatched:
+        print(f"  warning: {len(unmatched)} unmatched couple key(s): {unmatched}")
+
+    def lookup(couple: str, field: str):
+        return mapping.get(couple, {}).get(field)
+
+    joined = weekly.with_columns(
+        pl.col("couple")
+        .map_elements(lambda c: lookup(c, "celebrity"), return_dtype=pl.String)
+        .alias("celebrity"),
+        pl.col("couple")
+        .map_elements(lambda c: lookup(c, "notability"), return_dtype=pl.String)
+        .alias("notability"),
+        pl.col("couple")
+        .map_elements(lambda c: lookup(c, "professional"), return_dtype=pl.String)
+        .alias("professional"),
+        pl.col("couple")
+        .map_elements(lambda c: lookup(c, "status"), return_dtype=pl.String)
+        .alias("status"),
+    )
+    return joined
+
+
+def scrape_season(season: int) -> pl.DataFrame:
+    soup = fetch_soup(season)
+    cast = parse_cast_table(soup)
+    weekly = parse_weekly_score_tables(soup, season)
+    return join_cast_into_weekly(cast, weekly)
+
+
+def save_season(season: int, out_dir: Path = DATA_DIR) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df = scrape_season(season)
+    out_path = out_dir / f"season-{season}.parquet"
+    df.write_parquet(out_path)
+    return out_path
+
+
+def scrape_all_seasons(
+    first: int = FIRST_SEASON, last: int = LAST_SEASON, delay: float = 1.0
+) -> None:
+    failures = []
+    for season in range(first, last + 1):
+        print(f"season {season}...")
+        try:
+            out_path = save_season(season)
+            print(f"  saved {out_path}")
+        except Exception as exc:
+            print(f"  FAILED: {exc}")
+            failures.append(season)
+        time.sleep(delay)
+
+    if failures:
+        print(f"\nseasons that failed to scrape: {failures}")
+    else:
+        print("\nall seasons scraped successfully")
+
+
+if __name__ == "__main__":
+    scrape_all_seasons()

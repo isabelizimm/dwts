@@ -1,0 +1,176 @@
+---
+title: "Dancing with the Stars: Best Dances and Pros"
+format: html
+jupyter: dwts-venv
+execute:
+  echo: true
+---
+
+## Setup
+
+This analysis uses the combined weekly-scores dataset (seasons 1-34), scraped
+from Wikipedia. We restrict to rows that:
+
+- Have a matched celebrity **and** professional (a small number of couples
+  could not be reliably matched back to the cast table and are dropped).
+- Are **not** team/group dances (relays, marathons, "Team" theme dances,
+  season finale trios, etc.) — we're only interested in a single celebrity/pro
+  couple's individual performance.
+- Have a single, well-formed dance style (a handful of rows list two dances
+  or a swapped mid-season partner and are dropped rather than guessed at).
+
+Because the number of judges scoring a routine varies across the show's
+history (3 judges most seasons, 4 in others, occasionally more), we compare
+routines using the **average score per judge** rather than the raw total, so
+scores are on a comparable ~0-10 scale throughout.
+
+```{python}
+import re
+
+import polars as pl
+from plotnine import *
+
+df = pl.read_parquet("../data/dwts_all_seasons.parquet")
+
+# team/group/relay/marathon-style dances and other malformed multi-dance
+# entries we don't want mixed in with individual couple performances
+TEAM_DANCE_PATTERN = r"(?i)team|group|relay|marathon|megamix|&|\(|\)"
+
+clean = (
+    df.with_columns(
+        pl.col("judge_scores").list.len().alias("n_judges"),
+    )
+    .filter(
+        pl.col("is_group_dance").not_(),
+        pl.col("celebrity").is_not_null(),
+        pl.col("professional").is_not_null(),
+        pl.col("professional").str.contains(r"\(").not_(),  # mid-season partner swaps
+        pl.col("dance").is_not_null(),
+        pl.col("dance").str.contains(TEAM_DANCE_PATTERN).not_(),
+        pl.col("total_score").is_not_null(),
+        pl.col("n_judges").is_not_null(),
+    )
+    .with_columns((pl.col("total_score") / pl.col("n_judges")).alias("avg_judge_score"))
+)
+
+print(f"{df.height} total rows -> {clean.height} individual-couple rows kept")
+```
+
+## Which pros score the highest?
+
+For each professional dancer, we compute their average per-judge score across
+every individual routine in the dataset. To avoid ranking pros who only
+danced a handful of times, we require at least 15 qualifying routines.
+
+```{python}
+MIN_DANCES = 15
+
+pro_summary = (
+    clean.group_by("professional")
+    .agg(
+        pl.len().alias("n_dances"),
+        pl.col("avg_judge_score").mean().alias("mean_score"),
+        pl.col("avg_judge_score").std().alias("sd_score"),
+    )
+    .filter(pl.col("n_dances") >= MIN_DANCES)
+)
+
+top_scoring_pros = pro_summary.sort("mean_score", descending=True).head(15)
+top_scoring_pros
+```
+
+```{python}
+p = (
+    ggplot(
+        top_scoring_pros,
+        aes(x="reorder(professional, mean_score)", y="mean_score"),
+    )
+    + geom_col(fill="#c94277")
+    + coord_flip()
+    + labs(
+        title="Highest-scoring professionals (avg. score per judge)",
+        subtitle=f"Individual couple dances only, min. {MIN_DANCES} routines",
+        x="",
+        y="Average score per judge",
+    )
+    + theme_minimal()
+)
+
+p
+```
+
+## Which pros are the most consistent?
+
+"Consistent" here means a low standard deviation in per-judge score across
+all of a pro's routines — i.e. they don't swing between very high and very
+low scores from week to week. This is a different question from who scores
+highest on average; a pro could be consistently mediocre or consistently
+excellent.
+
+```{python}
+most_consistent_pros = pro_summary.sort("sd_score").head(15)
+most_consistent_pros
+```
+
+```{python}
+p = (
+    ggplot(pro_summary, aes(x="mean_score", y="sd_score"))
+    + geom_point(alpha=0.6, size=2)
+    + labs(
+        title="Average score vs. consistency by professional",
+        subtitle=f"Individual couple dances only, min. {MIN_DANCES} routines",
+        x="Average score per judge",
+        y="Standard deviation of score per judge (lower = more consistent)",
+    )
+    + theme_minimal()
+)
+
+p
+```
+
+Note the mild tradeoff visible above: pros with higher average scores also
+tend to have somewhat lower variance, which makes sense if stronger dancers
+are less likely to have a truly bad week.
+
+## Which dance styles score the highest?
+
+Now looking at dance style rather than pro: does the show's panel score some
+dance styles more generously than others? Again using average score per
+judge, and again restricted to individual (non-team) couple performances.
+
+```{python}
+MIN_DANCE_COUNT = 10
+
+dance_summary = (
+    clean.group_by("dance")
+    .agg(
+        pl.len().alias("n_routines"),
+        pl.col("avg_judge_score").mean().alias("mean_score"),
+        pl.col("avg_judge_score").std().alias("sd_score"),
+    )
+    .filter(pl.col("n_routines") >= MIN_DANCE_COUNT)
+    .sort("mean_score", descending=True)
+)
+
+dance_summary
+```
+
+```{python}
+p = (
+    ggplot(
+        dance_summary,
+        aes(x="reorder(dance, mean_score)", y="mean_score"),
+    )
+    + geom_col(fill="#3b7dd8")
+    + coord_flip()
+    + labs(
+        title="Average score per judge by dance style",
+        subtitle=f"Individual couple dances only, min. {MIN_DANCE_COUNT} routines",
+        x="",
+        y="Average score per judge",
+    )
+    + theme_minimal()
+)
+
+p
+```

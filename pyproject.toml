@@ -1,0 +1,21 @@
+[project]
+name = "dwts"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "html5lib>=1.1",
+    "lxml>=6.1.2",
+    "plotnine>=0.15.8",
+    "polars>=1.44.1",
+    "pyarrow>=25.0.1",
+    "requests>=2.34.2",
+]
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+    "pyyaml>=6.0.3",
+]
