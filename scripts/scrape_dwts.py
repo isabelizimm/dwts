@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 
 from wiki import expand_table_rows, fetch_soup, normalize_header
 
-DATA_DIR = Path("data")
+DATA_DIR = Path("data") / "raw"
 FIRST_SEASON = 1
 LAST_SEASON = 34
 
@@ -183,7 +183,7 @@ def scrape_season(season: int) -> pl.DataFrame:
 def save_season(season: int, out_dir: Path = DATA_DIR) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     df = scrape_season(season)
-    out_path = out_dir / f"season-{season}.parquet"
+    out_path = out_dir / f"season-{season:02d}.parquet"
     df.write_parquet(out_path)
     return out_path
 

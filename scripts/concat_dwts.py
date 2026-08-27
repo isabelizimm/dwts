@@ -5,10 +5,11 @@ from pathlib import Path
 import polars as pl
 
 DATA_DIR = Path("data")
+RAW_DIR = DATA_DIR / "raw"
 OUT_PATH = DATA_DIR / "dwts_all_seasons.parquet"
 
 
-def concat_seasons(data_dir: Path = DATA_DIR) -> pl.DataFrame:
+def concat_seasons(data_dir: Path = RAW_DIR) -> pl.DataFrame:
     season_files = sorted(
         data_dir.glob("season-*.parquet"),
         key=lambda p: int(p.stem.split("-")[1]),
