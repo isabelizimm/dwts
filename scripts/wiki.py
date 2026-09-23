@@ -1,7 +1,5 @@
 """Shared helpers for scraping Dancing with the Stars data from Wikipedia.
 
-Extracted from scrape_dwts.py so the air-date scraper can reuse the same
-table-flattening logic.
 """
 
 import re
