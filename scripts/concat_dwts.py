@@ -7,6 +7,8 @@ import polars as pl
 DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
 AIR_DATES_PATH = DATA_DIR / "air_dates.parquet"
+BIRTHDATES_PATH = DATA_DIR / "celebrity_birthdates.parquet"
+BIRTHPLACES_PATH = DATA_DIR / "celebrity_birthplaces.parquet"
 OUT_PATH = DATA_DIR / "dwts_all_seasons.parquet"
 
 
@@ -40,8 +42,88 @@ def attach_air_dates(combined: pl.DataFrame) -> pl.DataFrame:
     return joined
 
 
+def attach_ages(combined: pl.DataFrame) -> pl.DataFrame:
+    """Add birthdate and the celebrity's age at the performance.
+
+    `age` is exact years (e.g. 46.4), so floor it for a whole-number age.
+    Requires air_date, since the age is measured at the performance rather
+    than at some fixed point in the season.
+    """
+    if not BIRTHDATES_PATH.exists():
+        print(f"note: {BIRTHDATES_PATH} not found; run scrape_birthdates.py to add ages")
+        return combined
+    if "air_date" not in combined.columns:
+        print("note: no air_date column, so ages cannot be computed")
+        return combined
+
+    birthdates = pl.read_parquet(BIRTHDATES_PATH).select(
+        "celebrity", "birthdate", "birthdate_precision"
+    )
+    joined = combined.join(birthdates, on="celebrity", how="left").with_columns(
+        (
+            (pl.col("air_date") - pl.col("birthdate")).dt.total_days() / 365.2425
+        ).alias("age")
+    )
+
+    known = joined.filter(pl.col("celebrity").is_not_null())
+    missing = known.get_column("age").null_count()
+    if missing:
+        names = (
+            known.filter(pl.col("age").is_null())
+            .get_column("celebrity")
+            .unique()
+            .to_list()
+        )
+        print(f"note: {missing} rows have no age ({len(names)} celebrities: {names})")
+
+    # Willow Shields was 14 in season 20, so the floor has to sit below that;
+    # this is a guard against a mis-resolved person, not a realism check.
+    implausible = joined.filter(
+        pl.col("age").is_not_null(), (pl.col("age") < 10) | (pl.col("age") > 95)
+    )
+    if implausible.height:
+        raise ValueError(
+            f"VALIDATION FAILED: {implausible.height} rows have an implausible age\n"
+            f"{implausible.select('season', 'celebrity', 'air_date', 'birthdate', 'age')}"
+        )
+
+    return joined
+
+
+def attach_birthplaces(combined: pl.DataFrame) -> pl.DataFrame:
+    """Add each celebrity's birth city, state and country.
+
+    `birth_state` is null wherever a state is not a meaningful unit (the UK,
+    Ireland, Cuba and so on), so a null there is not a gap in the data.
+    """
+    if not BIRTHPLACES_PATH.exists():
+        print(f"note: {BIRTHPLACES_PATH} not found; run scrape_birthplaces.py to add it")
+        return combined
+
+    birthplaces = pl.read_parquet(BIRTHPLACES_PATH).select(
+        "celebrity", "birth_city", "birth_state", "birth_country"
+    )
+    joined = combined.join(birthplaces, on="celebrity", how="left")
+
+    known = joined.filter(pl.col("celebrity").is_not_null())
+    missing = known.get_column("birth_country").null_count()
+    if missing:
+        names = (
+            known.filter(pl.col("birth_country").is_null())
+            .get_column("celebrity")
+            .unique()
+            .to_list()
+        )
+        print(f"note: {missing} rows have no birthplace ({len(names)} celebrities: {names})")
+
+    return joined
+
+
 if __name__ == "__main__":
-    combined = attach_air_dates(concat_seasons())
+    try:
+        combined = attach_birthplaces(attach_ages(attach_air_dates(concat_seasons())))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     combined.write_parquet(OUT_PATH)
     print(f"combined {combined.get_column('season').n_unique()} seasons")
     print(f"wrote {combined.height} rows to {OUT_PATH}")
